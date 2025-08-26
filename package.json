@@ -1,0 +1,76 @@
+{
+  "name": "aimem-smart",
+  "version": "1.4.0",
+  "description": "AI Memory Management MCP Server - Intelligent context storage and retrieval for AI systems",
+  "main": "index.js",
+  "bin": {
+    "aimem": "./bin/aimem-wrapper.js"
+  },
+  "files": [
+    "bin/aimem-wrapper.js",
+    "dist/aimem",
+    "README.md",
+    "aimem.yaml",
+    "scripts/"
+  ],
+  "scripts": {
+    "preinstall": "node scripts/install.js",
+    "postinstall": "node scripts/postinstall.js",
+    "build": "go build -o dist/aimem cmd/aimem/main.go",
+    "test": "npm run test:unit",
+    "test:unit": "go test -short ./internal/...",
+    "test:integration": "go test ./...",
+    "start": "node bin/aimem-wrapper.js",
+    "dev": "./dist/aimem"
+  },
+  "keywords": [
+    "ai",
+    "memory",
+    "context",
+    "mcp",
+    "model-context-protocol",
+    "llm",
+    "claude",
+    "semantic-search",
+    "sqlite",
+    "zero-dependency"
+  ],
+  "author": {
+    "name": "tarkank",
+    "email": "your-email@example.com"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tarkank/aimem.git"
+  },
+  "homepage": "https://github.com/tarkank/aimem#readme",
+  "bugs": {
+    "url": "https://github.com/tarkank/aimem/issues"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  },
+  "optionalDependencies": {
+    "@ybo/aimem-darwin-x64": "1.0.0",
+    "@ybo/aimem-darwin-arm64": "1.0.0",
+    "@ybo/aimem-linux-x64": "1.0.0",
+    "@ybo/aimem-linux-arm64": "1.0.0",
+    "@ybo/aimem-win32-x64": "1.0.0"
+  }
+}
