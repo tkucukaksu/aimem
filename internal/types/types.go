@@ -209,3 +209,40 @@ type MCPConfig struct {
 	Version       string `yaml:"version"`
 	Description   string `yaml:"description"`
 }
+
+// Response pagination and size limiting
+type ResponsePaging struct {
+	PageSize     int    `json:"page_size"`
+	CurrentPage  int    `json:"current_page"`
+	TotalPages   int    `json:"total_pages"`
+	TotalItems   int    `json:"total_items"`
+	HasMore      bool   `json:"has_more"`
+	NextPageToken string `json:"next_page_token,omitempty"`
+}
+
+// TokenLimits for response size control
+type TokenLimits struct {
+	MaxResponseTokens   int `json:"max_response_tokens"`   // Maximum tokens in response
+	EstimatedTokens     int `json:"estimated_tokens"`     // Current estimated token count
+	TruncatedContent    bool `json:"truncated_content"`    // Whether content was truncated
+}
+
+// Response size configuration
+type ResponseConfig struct {
+	MaxTokens       int  `json:"max_tokens"`        // Default: 20000 (below 25000 limit)
+	EnablePaging    bool `json:"enable_paging"`     // Enable pagination for large results
+	PageSize        int  `json:"page_size"`         // Items per page
+	TruncateContent bool `json:"truncate_content"`  // Truncate individual chunks if needed
+}
+
+// PaginatedRetrievalResult with size limiting
+type PaginatedRetrievalResult struct {
+	PrimaryChunks       []ContextChunk        `json:"primary_chunks"`
+	RelatedChunks       []ContextChunk        `json:"related_chunks"`
+	Relationships       []ContextRelationship `json:"relationships"`
+	RetrievalReason     string                `json:"retrieval_reason"`
+	TotalRelevance      float64               `json:"total_relevance"`
+	ProcessingTimeMs    int64                 `json:"processing_time_ms"`
+	Paging              *ResponsePaging       `json:"paging,omitempty"`
+	TokenLimits         TokenLimits           `json:"token_limits"`
+}

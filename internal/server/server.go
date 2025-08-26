@@ -21,6 +21,7 @@ import (
 	"github.com/tarkank/aimem/internal/storage"
 	"github.com/tarkank/aimem/internal/summarizer"
 	"github.com/tarkank/aimem/internal/types"
+	"github.com/tarkank/aimem/internal/utils"
 )
 
 // AIMem represents the main MCP server
@@ -30,6 +31,7 @@ type AIMem struct {
 	chunker    *chunker.Service
 	summarizer *summarizer.Service
 	analyzer   *analyzer.ProjectAnalyzer
+	limiter    *utils.ResponseLimiter
 	config     *types.Config
 	logger     *logger.Logger
 }
@@ -101,12 +103,16 @@ func NewAIMem(config *types.Config) (*AIMem, error) {
 	// Initialize project analyzer
 	projectAnalyzer := analyzer.NewProjectAnalyzer()
 
+	// Initialize response limiter
+	responseLimiter := utils.NewResponseLimiter()
+
 	return &AIMem{
 		storage:    storageInstance,
 		embedder:   embeddingService,
 		chunker:    chunkingService,
 		summarizer: summarizationService,
 		analyzer:   projectAnalyzer,
+		limiter:    responseLimiter,
 		config:     config,
 		logger:     aimemLogger,
 	}, nil
@@ -1100,7 +1106,7 @@ func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args
 func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
 	startTime := time.Now()
 	
-	// Extract parameters
+	// Extract required parameters
 	sessionID, ok := args["session_id"].(string)
 	if !ok {
 		return mcp.NewErrorResponse(id, mcp.NewError(
@@ -1129,13 +1135,13 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 	}
 	taskType := types.TaskType(taskTypeStr)
 	
-	// Parse optional parameters
+	// Parse optional parameters with defaults
 	autoExpand := false
 	if expand, exists := args["auto_expand"].(bool); exists {
 		autoExpand = expand
 	}
 	
-	maxChunks := 5
+	maxChunks := 10
 	if max, exists := args["max_chunks"].(float64); exists {
 		maxChunks = int(max)
 	}
@@ -1145,15 +1151,51 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 		contextDepth = int(depth)
 	}
 	
+	maxResponseTokens := 20000
+	if tokens, exists := args["max_response_tokens"].(float64); exists {
+		maxResponseTokens = int(tokens)
+		// Ensure it's within limits
+		if maxResponseTokens < 1000 {
+			maxResponseTokens = 1000
+		} else if maxResponseTokens > 24000 {
+			maxResponseTokens = 24000
+		}
+	}
+	
+	page := 1
+	if pageNum, exists := args["page"].(float64); exists {
+		page = int(pageNum)
+		if page < 1 {
+			page = 1
+		}
+	}
+	
+	enablePagination := true
+	if paging, exists := args["enable_pagination"].(bool); exists {
+		enablePagination = paging
+	}
+	
 	a.logger.Info("Starting context-aware retrieval", map[string]interface{}{
-		"session_id":     sessionID,
-		"current_task":   currentTask,
-		"task_type":      taskType,
-		"auto_expand":    autoExpand,
-		"max_chunks":     maxChunks,
-		"context_depth":  contextDepth,
-		"operation":      "context_aware_retrieve",
+		"session_id":         sessionID,
+		"current_task":       currentTask,
+		"task_type":          taskType,
+		"auto_expand":        autoExpand,
+		"max_chunks":         maxChunks,
+		"context_depth":      contextDepth,
+		"max_response_tokens": maxResponseTokens,
+		"page":               page,
+		"enable_pagination":  enablePagination,
+		"operation":          "context_aware_retrieve",
 	})
+	
+	// Configure response limiter for this request
+	responseConfig := types.ResponseConfig{
+		MaxTokens:       maxResponseTokens,
+		EnablePaging:    enablePagination,
+		PageSize:        maxChunks / 2, // Reasonable page size
+		TruncateContent: true,
+	}
+	requestLimiter := utils.NewResponseLimiterWithConfig(responseConfig)
 	
 	// Create enhanced query based on task type
 	enhancedQuery := a.enhanceQueryByTaskType(currentTask, taskType)
@@ -1168,8 +1210,13 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 		))
 	}
 	
-	// Retrieve chunks
-	chunks, err := a.storage.SearchByEmbedding(ctx, sessionID, embedding, maxChunks)
+	// Retrieve chunks (get more than maxChunks to have options for selection)
+	searchLimit := maxChunks * 3
+	if searchLimit > 100 {
+		searchLimit = 100
+	}
+	
+	allChunks, err := a.storage.SearchByEmbedding(ctx, sessionID, embedding, searchLimit)
 	if err != nil {
 		return mcp.NewErrorResponse(id, mcp.NewError(
 			mcp.ErrorCodeInternalError,
@@ -1178,54 +1225,95 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 		))
 	}
 	
-	// Calculate enhanced relevance scores
-	for _, chunk := range chunks {
+	// Calculate enhanced relevance scores and sort
+	for _, chunk := range allChunks {
 		chunk.Relevance = a.calculateTaskAwareRelevance(chunk, taskType, currentTask)
 	}
 	
-	// Sort by enhanced relevance
-	sort.Slice(chunks, func(i, j int) bool {
-		return chunks[i].Relevance > chunks[j].Relevance
+	sort.Slice(allChunks, func(i, j int) bool {
+		return allChunks[i].Relevance > allChunks[j].Relevance
 	})
+	
+	// Select primary chunks based on maxChunks limit
+	primaryChunks := allChunks
+	if len(primaryChunks) > maxChunks {
+		primaryChunks = primaryChunks[:maxChunks]
+	}
 	
 	var relatedChunks []*types.ContextChunk
 	var relationships []types.ContextRelationship
 	
 	// Auto-expand with related context if enabled
-	if autoExpand && len(chunks) > 0 {
-		relatedChunks, relationships = a.expandWithRelatedContext(chunks, contextDepth, maxChunks)
+	if autoExpand && len(primaryChunks) > 0 {
+		relatedChunks, relationships = a.expandWithRelatedContext(primaryChunks, contextDepth, maxChunks/2)
 	}
 	
 	totalRelevance := 0.0
-	for _, chunk := range chunks {
+	for _, chunk := range primaryChunks {
 		totalRelevance += chunk.Relevance
 	}
 	
 	totalLatency := time.Since(startTime)
 	
+	// Use response limiter to create paginated and size-limited response
+	retrievalReason := fmt.Sprintf("Context-aware retrieval for %s task: %s", taskType, currentTask)
+	
+	limitedResult := requestLimiter.LimitContextAwareRetrievalResponse(
+		primaryChunks,
+		relatedChunks,
+		relationships,
+		retrievalReason,
+		totalRelevance,
+		totalLatency.Milliseconds(),
+		page,
+	)
+	
 	a.logger.Info("Context-aware retrieval completed", map[string]interface{}{
 		"operation":             "context_aware_retrieve",
 		"session_id":            sessionID,
 		"task_type":             taskType,
-		"chunks_found":          len(chunks),
-		"related_chunks_found":  len(relatedChunks),
-		"relationships_found":   len(relationships),
+		"chunks_found":          len(allChunks),
+		"primary_returned":      len(limitedResult.PrimaryChunks),
+		"related_returned":      len(limitedResult.RelatedChunks),
+		"relationships_returned": len(limitedResult.Relationships),
 		"total_relevance":       totalRelevance,
 		"total_latency_ms":      totalLatency.Milliseconds(),
+		"estimated_tokens":      limitedResult.TokenLimits.EstimatedTokens,
+		"truncated_content":     limitedResult.TokenLimits.TruncatedContent,
 		"auto_expand":           autoExpand,
 	})
 	
-	// Build response
+	// Build human-readable response text
 	var contentParts []string
 	
+	// Header with metadata
 	contentParts = append(contentParts, fmt.Sprintf(
-		"🎯 **Context-Aware Retrieval**: %s\n\n**Task Type**: %s\n**Query Enhancement**: Applied\n**Auto-Expand**: %t\n\n",
-		currentTask, taskType, autoExpand,
+		"🎯 **Context-Aware Retrieval**: %s\n\n**Task Type**: %s\n**Query Enhancement**: Applied\n**Auto-Expand**: %t\n**Token Budget**: %d (Estimated: %d)\n",
+		currentTask, taskType, autoExpand, maxResponseTokens, limitedResult.TokenLimits.EstimatedTokens,
 	))
 	
-	if len(chunks) > 0 {
-		contentParts = append(contentParts, fmt.Sprintf("**Primary Context** (%d chunks):\n", len(chunks)))
-		for i, chunk := range chunks {
+	// Pagination info if applicable
+	if limitedResult.Paging != nil {
+		contentParts = append(contentParts, fmt.Sprintf(
+			"**Page**: %d of %d (Total items: %d)\n",
+			limitedResult.Paging.CurrentPage, limitedResult.Paging.TotalPages, limitedResult.Paging.TotalItems,
+		))
+		if limitedResult.Paging.HasMore {
+			contentParts = append(contentParts, fmt.Sprintf("**Next Page Token**: %s\n", limitedResult.Paging.NextPageToken))
+		}
+	}
+	
+	// Truncation warning if needed
+	if limitedResult.TokenLimits.TruncatedContent {
+		contentParts = append(contentParts, "⚠️ **Content was truncated to fit token limits**\n")
+	}
+	
+	contentParts = append(contentParts, "\n")
+	
+	// Primary chunks
+	if len(limitedResult.PrimaryChunks) > 0 {
+		contentParts = append(contentParts, fmt.Sprintf("**Primary Context** (%d chunks):\n", len(limitedResult.PrimaryChunks)))
+		for i, chunk := range limitedResult.PrimaryChunks {
 			contentParts = append(contentParts, fmt.Sprintf(
 				"**Chunk %d** (ID: %s, Relevance: %.3f)\n%s\n\n",
 				i+1, chunk.ID, chunk.Relevance, chunk.Content,
@@ -1233,9 +1321,10 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 		}
 	}
 	
-	if len(relatedChunks) > 0 {
-		contentParts = append(contentParts, fmt.Sprintf("**Related Context** (%d chunks):\n", len(relatedChunks)))
-		for i, chunk := range relatedChunks {
+	// Related chunks
+	if len(limitedResult.RelatedChunks) > 0 {
+		contentParts = append(contentParts, fmt.Sprintf("**Related Context** (%d chunks):\n", len(limitedResult.RelatedChunks)))
+		for i, chunk := range limitedResult.RelatedChunks {
 			contentParts = append(contentParts, fmt.Sprintf(
 				"**Related %d** (ID: %s, Relevance: %.3f)\n%s\n\n",
 				i+1, chunk.ID, chunk.Relevance, chunk.Content,
@@ -1243,9 +1332,10 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 		}
 	}
 	
-	if len(relationships) > 0 {
-		contentParts = append(contentParts, fmt.Sprintf("**Context Relationships** (%d found):\n", len(relationships)))
-		for _, rel := range relationships {
+	// Relationships
+	if len(limitedResult.Relationships) > 0 {
+		contentParts = append(contentParts, fmt.Sprintf("**Context Relationships** (%d found):\n", len(limitedResult.Relationships)))
+		for _, rel := range limitedResult.Relationships {
 			contentParts = append(contentParts, fmt.Sprintf(
 				"- %s → Strength: %.3f (%s)\n",
 				rel.ChunkID, rel.Strength, rel.Reason,

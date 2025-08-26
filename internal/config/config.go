@@ -115,7 +115,7 @@ func GetDefaultConfig() *types.Config {
 		},
 		MCP: types.MCPConfig{
 			ServerName:  "AIMem",
-			Version:     "1.3.0",
+			Version:     "1.5.0",
 			Description: "AI Memory Management Server - SQLite powered, zero external dependencies",
 		},
 	}

@@ -7,7 +7,7 @@
 
 **AIMem** is an intelligent AI Memory Management MCP (Model Context Protocol) server that solves context limitation problems in AI conversations through persistent, semantic memory storage and retrieval.
 
-> 🚀 **v1.4.0**: Now with **zero external dependencies** - SQLite powered, fully self-contained!
+> 🚀 **v1.5.0**: Now with **Response Size Limiting** - prevents >25K token MCP responses, includes pagination and smart truncation!
 
 ## 🎯 What is AIMem?
 

@@ -74,6 +74,21 @@ func GetTools() []Tool {
 						Minimum:     intPtr(1),
 						Maximum:     intPtr(5),
 					},
+					"max_response_tokens": {
+						Type:        "integer",
+						Description: "Maximum tokens allowed in response (default: 20000, max: 24000)",
+						Minimum:     intPtr(1000),
+						Maximum:     intPtr(24000),
+					},
+					"page": {
+						Type:        "integer",
+						Description: "Page number for paginated results (default: 1)",
+						Minimum:     intPtr(1),
+					},
+					"enable_pagination": {
+						Type:        "boolean",
+						Description: "Enable pagination for large results (default: true)",
+					},
 				},
 				Required: []string{"session_id", "current_task", "task_type"},
 			},
