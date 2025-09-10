@@ -1,7 +1,7 @@
 {
   "name": "aimem-smart",
-  "version": "1.5.0",
-  "description": "AI Memory Management MCP Server - Intelligent context storage with response size limiting and pagination",
+  "version": "2.0.0",
+  "description": "AIMem - Intelligent Memory Management MCP Server with Project-Aware Sessions, Performance Monitoring, and Advanced Context Storage",
   "main": "index.js",
   "bin": {
     "aimem": "./bin/aimem-wrapper.js"
@@ -33,7 +33,11 @@
     "claude",
     "semantic-search",
     "sqlite",
-    "zero-dependency",
+    "session-management",
+    "project-aware",
+    "performance-monitoring",
+    "intelligent-memory",
+    "context-storage",
     "response-limiting",
     "pagination",
     "token-management"

@@ -1,0 +1,83 @@
+# AIMem Development Configuration
+# This file provides optimized settings for development workflows
+
+# Storage configuration - SQLite for development simplicity
+database: "sqlite"
+
+sqlite:
+  database_path: "~/.aimem/dev_aimem.db"
+  max_connections: 5
+  max_idle_connections: 2
+  connection_max_lifetime: 30
+
+# Memory settings optimized for development
+memory:
+  max_session_size: "50MB"
+  chunk_size: 1024
+  max_chunks_per_query: 15
+  ttl_default: 12h  # Shorter for development iterations
+
+# Embedding configuration for development
+embedding:
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  cache_size: 500
+  batch_size: 16
+
+# Performance settings for development
+performance:
+  compression_enabled: false  # Disabled for faster development
+  async_processing: false     # Synchronous for easier debugging
+  cache_embeddings: true
+  enable_metrics: true
+  metrics_interval: 10s       # More frequent metrics for monitoring
+
+# Session Manager - Developer-friendly settings
+session_manager:
+  enable_auto_detection: true
+  enable_legacy_migration: true
+  default_session_type: "main"
+  session_cache_size: 50
+  session_timeout: 8h         # Work day timeout
+  max_sessions_per_project: 5
+  enable_session_hierarchy: true
+  auto_cleanup_inactive: false  # Manual control in development
+  inactive_threshold: 24h
+
+# Project Detector - Fast detection for development
+project_detector:
+  enable_caching: true
+  cache_timeout: 5m           # Shorter cache for development changes
+  max_cache_size: 100
+  deep_scan_enabled: false    # Faster detection, less thorough
+  git_detection_enabled: true
+  workspace_detection_enabled: true
+  language_detection_enabled: true
+  custom_workspace_markers:
+    - "dev.config"
+    - "local.settings"
+  ignore_patterns:
+    - "node_modules"
+    - ".git"
+    - ".vscode"
+    - ".idea"
+    - "vendor"
+    - "target"
+    - "build"
+    - "dist"
+    - ".next"
+    - ".nuxt"
+    - "__pycache__"
+    - ".pytest_cache"
+
+# MCP settings
+mcp:
+  server_name: "AIMem-Dev"
+  version: "2.0.0-dev"
+  description: "AIMem Development Server with Enhanced Debugging"
+
+# Logging configuration for development
+logging:
+  level: "debug"
+  format: "text"
+  output: "stdout"
+  enable_caller: true

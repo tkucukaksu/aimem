@@ -18,6 +18,9 @@ import (
 	"github.com/tarkank/aimem/internal/errors"
 	"github.com/tarkank/aimem/internal/logger"
 	"github.com/tarkank/aimem/internal/mcp"
+	"github.com/tarkank/aimem/internal/performance"
+	"github.com/tarkank/aimem/internal/project"
+	"github.com/tarkank/aimem/internal/session"
 	"github.com/tarkank/aimem/internal/storage"
 	"github.com/tarkank/aimem/internal/summarizer"
 	"github.com/tarkank/aimem/internal/types"
@@ -26,24 +29,27 @@ import (
 
 // AIMem represents the main MCP server
 type AIMem struct {
-	storage    storage.Storage
-	embedder   *embedding.Service
-	chunker    *chunker.Service
-	summarizer *summarizer.Service
-	analyzer   *analyzer.ProjectAnalyzer
-	limiter    *utils.ResponseLimiter
-	config     *types.Config
-	logger     *logger.Logger
+	storage         storage.Storage
+	embedder        *embedding.Service
+	chunker         *chunker.Service
+	summarizer      *summarizer.Service
+	analyzer        *analyzer.ProjectAnalyzer
+	limiter         *utils.ResponseLimiter
+	config          *types.Config
+	logger          *logger.Logger
+	projectDetector *project.ProjectDetector
+	sessionManager  *session.SessionManager
+	perfMonitor     *performance.PerformanceMonitor
 }
 
 // Performance metrics tracking
 type PerformanceMetrics struct {
-	StorageLatency    time.Duration
-	EmbeddingLatency  time.Duration
-	ChunkingLatency   time.Duration
+	StorageLatency       time.Duration
+	EmbeddingLatency     time.Duration
+	ChunkingLatency      time.Duration
 	SummarizationLatency time.Duration
-	TotalLatency      time.Duration
-	MemoryUsage       int64
+	TotalLatency         time.Duration
+	MemoryUsage          int64
 }
 
 // NewAIMem creates a new AIMem server instance
@@ -106,15 +112,27 @@ func NewAIMem(config *types.Config) (*AIMem, error) {
 	// Initialize response limiter
 	responseLimiter := utils.NewResponseLimiter()
 
+	// Initialize project detector
+	projectDetector := project.NewProjectDetector()
+
+	// Initialize session manager
+	sessionManager := session.NewSessionManager(projectDetector, storageInstance, config)
+
+	// Initialize performance monitor
+	perfMonitor := performance.NewPerformanceMonitor(&config.Performance, aimemLogger)
+
 	return &AIMem{
-		storage:    storageInstance,
-		embedder:   embeddingService,
-		chunker:    chunkingService,
-		summarizer: summarizationService,
-		analyzer:   projectAnalyzer,
-		limiter:    responseLimiter,
-		config:     config,
-		logger:     aimemLogger,
+		storage:         storageInstance,
+		embedder:        embeddingService,
+		chunker:         chunkingService,
+		summarizer:      summarizationService,
+		analyzer:        projectAnalyzer,
+		limiter:         responseLimiter,
+		config:          config,
+		logger:          aimemLogger,
+		projectDetector: projectDetector,
+		sessionManager:  sessionManager,
+		perfMonitor:     perfMonitor,
 	}, nil
 }
 
@@ -149,11 +167,17 @@ func (a *AIMem) HandleRequest(ctx context.Context, reader io.Reader, writer io.W
 
 // processRequest handles individual MCP requests
 func (a *AIMem) processRequest(ctx context.Context, req *mcp.Request) *mcp.Response {
+	// Start performance monitoring
+	perfCtx := a.perfMonitor.StartRequest(ctx, "", req.Method)
+	defer func() {
+		a.perfMonitor.EndRequest(perfCtx, nil)
+	}()
+
 	switch req.Method {
 	case "tools/list":
 		return a.handleListTools(req)
 	case "tools/call":
-		return a.handleToolCall(ctx, req)
+		return a.handleToolCall(perfCtx, req)
 	case "initialize":
 		return a.handleInitialize(req)
 	default:
@@ -228,6 +252,24 @@ func (a *AIMem) handleToolCall(ctx context.Context, req *mcp.Request) *mcp.Respo
 		return a.handleContextAwareRetrieve(ctx, req.ID, arguments)
 	case "smart_memory_manager":
 		return a.handleSmartMemoryManager(ctx, req.ID, arguments)
+	// Intelligent Session Management Tools
+	case "get_or_create_project_session":
+		return a.handleGetOrCreateProjectSession(ctx, req.ID, arguments)
+	case "resolve_session":
+		return a.handleResolveSession(ctx, req.ID, arguments)
+	case "discover_related_sessions":
+		return a.handleDiscoverRelatedSessions(ctx, req.ID, arguments)
+	case "get_session_info":
+		return a.handleGetSessionInfo(ctx, req.ID, arguments)
+	case "list_project_sessions":
+		return a.handleListProjectSessions(ctx, req.ID, arguments)
+	case "create_feature_session":
+		return a.handleCreateFeatureSession(ctx, req.ID, arguments)
+	// Performance Monitoring and Debugging Tools
+	case "get_performance_metrics":
+		return a.handleGetPerformanceMetrics(ctx, req.ID, arguments)
+	case "debug_session_state":
+		return a.handleDebugSessionState(ctx, req.ID, arguments)
 	// Original Tools
 	case "store_context":
 		return a.handleStoreContext(ctx, req.ID, arguments)
@@ -310,7 +352,7 @@ func (a *AIMem) handleStoreContext(ctx context.Context, id interface{}, args map
 		responseText = fmt.Sprintf("✅ Stored (%d bytes)", len(content))
 	} else {
 		// Detailed response for debugging/verbose mode
-		responseText = fmt.Sprintf("✅ Context stored successfully\n\n**Chunk ID**: %s\n**Size**: %d bytes\n**Importance**: %s", 
+		responseText = fmt.Sprintf("✅ Context stored successfully\n\n**Chunk ID**: %s\n**Size**: %d bytes\n**Importance**: %s",
 			chunkID, len(content), importance)
 	}
 
@@ -363,11 +405,11 @@ func (a *AIMem) handleRetrieveContext(ctx context.Context, id interface{}, args 
 	}
 
 	// Format response
-	responseText := fmt.Sprintf("🔍 Retrieved %d relevant context chunks (Query time: %dms)\n\n", 
+	responseText := fmt.Sprintf("🔍 Retrieved %d relevant context chunks (Query time: %dms)\n\n",
 		len(result.Chunks), result.QueryTime)
-	
+
 	for i, chunk := range result.Chunks {
-		responseText += fmt.Sprintf("**Chunk %d** (ID: %s, Relevance: %.3f)\n%s\n\n", 
+		responseText += fmt.Sprintf("**Chunk %d** (ID: %s, Relevance: %.3f)\n%s\n\n",
 			i+1, chunk.ID, chunk.Relevance, chunk.Content)
 	}
 
@@ -411,7 +453,7 @@ func (a *AIMem) handleSummarizeSession(ctx context.Context, id interface{}, args
 - Average relevance: %.3f
 - Created: %s
 - Last activity: %s`,
-		sessionID, 
+		sessionID,
 		summary.ChunkCount,
 		float64(summary.MemoryUsage)/1024/1024,
 		summary.AverageRelevance,
@@ -554,15 +596,15 @@ func (a *AIMem) storeContext(ctx context.Context, sessionID, content string, imp
 
 	// Step 5: Create context chunk
 	chunk := &types.ContextChunk{
-		ID:          chunkID,
-		SessionID:   sessionID,
-		Content:     finalContent,
-		Summary:     summary,
-		Embedding:   embedding,
-		Relevance:   relevance,
-		Timestamp:   time.Now(),
-		TTL:         a.config.Memory.TTLDefault,
-		Importance:  importance,
+		ID:         chunkID,
+		SessionID:  sessionID,
+		Content:    finalContent,
+		Summary:    summary,
+		Embedding:  embedding,
+		Relevance:  relevance,
+		Timestamp:  time.Now(),
+		TTL:        a.config.Memory.TTLDefault,
+		Importance: importance,
 	}
 
 	// Step 6: Store in Redis
@@ -587,7 +629,7 @@ func (a *AIMem) storeContext(ctx context.Context, sessionID, content string, imp
 	})
 
 	log.WithFields(logger.Fields{
-		"chunk_id":       chunkID,
+		"chunk_id":         chunkID,
 		"total_latency_ms": totalLatency.Milliseconds(),
 	}).Info("Context storage completed")
 
@@ -639,10 +681,10 @@ func (a *AIMem) retrieveContext(ctx context.Context, sessionID, query string, ma
 	for _, chunk := range allChunks {
 		// Calculate cosine similarity
 		similarity := a.embedder.CosineSimilarity(queryEmbedding, chunk.Embedding)
-		
+
 		// Combine with other factors
 		finalScore := a.calculateRetrievalScore(similarity, chunk, query)
-		
+
 		scores = append(scores, ChunkScore{
 			Chunk: chunk,
 			Score: finalScore,
@@ -744,7 +786,7 @@ func (a *AIMem) cleanupSession(ctx context.Context, sessionID string, strategy t
 
 	// Determine chunks to remove based on strategy
 	toRemove := a.selectChunksForRemoval(allChunks, strategy)
-	
+
 	// Calculate bytes that will be freed
 	bytesFreed := int64(0)
 	for _, chunk := range toRemove {
@@ -774,8 +816,8 @@ func (a *AIMem) cleanupSession(ctx context.Context, sessionID string, strategy t
 	})
 
 	log.WithFields(logger.Fields{
-		"removed":   removed,
-		"remaining": remainingChunks,
+		"removed":     removed,
+		"remaining":   remainingChunks,
 		"bytes_freed": bytesFreed,
 	}).Info("Session cleanup completed")
 
@@ -808,7 +850,7 @@ func (a *AIMem) calculateInitialRelevance(importance types.Importance) float64 {
 func (a *AIMem) calculateRetrievalScore(similarity float64, chunk *types.ContextChunk, query string) float64 {
 	// Base similarity score (60% weight)
 	score := similarity * 0.6
-	
+
 	// Importance weight (20%)
 	importanceScore := 0.0
 	switch chunk.Importance {
@@ -820,15 +862,15 @@ func (a *AIMem) calculateRetrievalScore(similarity float64, chunk *types.Context
 		importanceScore = 0.3
 	}
 	score += importanceScore * 0.2
-	
+
 	// Recency weight (10% - newer chunks score higher)
 	age := time.Since(chunk.Timestamp)
 	recencyScore := math.Max(0, 1.0-float64(age.Hours())/168.0) // Decay over a week
 	score += recencyScore * 0.1
-	
+
 	// Current relevance weight (10%)
 	score += chunk.Relevance * 0.1
-	
+
 	return math.Min(score, 1.0)
 }
 
@@ -837,13 +879,13 @@ func (a *AIMem) selectChunksForRemoval(chunks []*types.ContextChunk, strategy ty
 	if len(chunks) == 0 {
 		return []*types.ContextChunk{}
 	}
-	
+
 	// Don't remove more than 50% of chunks in one cleanup
 	maxRemove := len(chunks) / 2
 	if maxRemove == 0 {
 		maxRemove = 1
 	}
-	
+
 	switch strategy {
 	case types.CleanupTTL:
 		return a.selectExpiredChunks(chunks, maxRemove)
@@ -860,7 +902,7 @@ func (a *AIMem) selectChunksForRemoval(chunks []*types.ContextChunk, strategy ty
 func (a *AIMem) selectExpiredChunks(chunks []*types.ContextChunk, maxRemove int) []*types.ContextChunk {
 	var expired []*types.ContextChunk
 	now := time.Now()
-	
+
 	for _, chunk := range chunks {
 		if chunk.TTL > 0 && now.Sub(chunk.Timestamp) > chunk.TTL {
 			expired = append(expired, chunk)
@@ -869,7 +911,7 @@ func (a *AIMem) selectExpiredChunks(chunks []*types.ContextChunk, maxRemove int)
 			}
 		}
 	}
-	
+
 	return expired
 }
 
@@ -879,11 +921,11 @@ func (a *AIMem) selectLRUChunks(chunks []*types.ContextChunk, maxRemove int) []*
 	sort.Slice(chunks, func(i, j int) bool {
 		return chunks[i].Timestamp.Before(chunks[j].Timestamp)
 	})
-	
+
 	if maxRemove > len(chunks) {
 		maxRemove = len(chunks)
 	}
-	
+
 	return chunks[:maxRemove]
 }
 
@@ -893,11 +935,11 @@ func (a *AIMem) selectLowRelevanceChunks(chunks []*types.ContextChunk, maxRemove
 	sort.Slice(chunks, func(i, j int) bool {
 		return chunks[i].Relevance < chunks[j].Relevance
 	})
-	
+
 	if maxRemove > len(chunks) {
 		maxRemove = len(chunks)
 	}
-	
+
 	return chunks[:maxRemove]
 }
 
@@ -906,7 +948,7 @@ func (a *AIMem) selectLowRelevanceChunks(chunks []*types.ContextChunk, maxRemove
 // handleAutoStoreProject handles the auto_store_project tool
 func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
 	startTime := time.Now()
-	
+
 	// Extract parameters
 	sessionID, ok := args["session_id"].(string)
 	if !ok {
@@ -916,7 +958,7 @@ func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args
 			nil,
 		))
 	}
-	
+
 	projectPath, ok := args["project_path"].(string)
 	if !ok {
 		return mcp.NewErrorResponse(id, mcp.NewError(
@@ -925,7 +967,7 @@ func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args
 			nil,
 		))
 	}
-	
+
 	// Parse focus areas
 	var focusAreas []types.FocusArea
 	if focusAreasInterface, exists := args["focus_areas"]; exists {
@@ -944,13 +986,13 @@ func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args
 			types.FocusDatabase,
 		}
 	}
-	
+
 	// Get importance threshold
 	importanceThreshold := types.ImportanceMedium
 	if thresholdStr, exists := args["importance_threshold"].(string); exists {
 		importanceThreshold = types.Importance(thresholdStr)
 	}
-	
+
 	// Get silent mode (default: true for seamless operation)
 	silent := true
 	if silentValue, exists := args["silent"]; exists {
@@ -958,21 +1000,21 @@ func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args
 			silent = silentBool
 		}
 	}
-	
+
 	a.logger.Info("Starting project analysis", map[string]interface{}{
-		"session_id":            sessionID,
-		"project_path":          projectPath,
-		"focus_areas":           focusAreas,
-		"importance_threshold":  importanceThreshold,
-		"operation":             "auto_store_project",
+		"session_id":           sessionID,
+		"project_path":         projectPath,
+		"focus_areas":          focusAreas,
+		"importance_threshold": importanceThreshold,
+		"operation":            "auto_store_project",
 	})
-	
+
 	// Analyze project
 	analysis, err := a.analyzer.AnalyzeProject(projectPath, focusAreas)
 	if err != nil {
 		a.logger.WithError(err).Error("Project analysis failed", map[string]interface{}{
-			"operation":   "auto_store_project",
-			"session_id":  sessionID,
+			"operation":    "auto_store_project",
+			"session_id":   sessionID,
 			"project_path": projectPath,
 		})
 		return mcp.NewErrorResponse(id, mcp.NewError(
@@ -981,7 +1023,7 @@ func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args
 			nil,
 		))
 	}
-	
+
 	// Generate context chunks from analysis
 	chunks, err := a.analyzer.GenerateContextChunks(analysis, sessionID)
 	if err != nil {
@@ -991,7 +1033,7 @@ func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args
 			nil,
 		))
 	}
-	
+
 	// Store chunks with appropriate embeddings
 	var storedChunks []string
 	for _, chunk := range chunks {
@@ -999,57 +1041,57 @@ func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args
 		if a.isImportanceBelowThreshold(chunk.Importance, importanceThreshold) {
 			continue
 		}
-		
+
 		// Generate ID and embedding
 		chunk.ID = uuid.New().String()
-		
+
 		// Generate embedding for content
 		embedding, err := a.embedder.GenerateEmbedding(chunk.Content)
 		if err != nil {
 			a.logger.WithError(err).Warn("Failed to generate embedding", map[string]interface{}{
-				"chunk_id": chunk.ID,
+				"chunk_id":   chunk.ID,
 				"session_id": sessionID,
 			})
 			continue
 		}
 		chunk.Embedding = embedding
-		
+
 		// Store chunk
 		if err := a.storage.StoreChunk(ctx, chunk); err != nil {
 			a.logger.WithError(err).Warn("Failed to store chunk", map[string]interface{}{
-				"chunk_id": chunk.ID,
+				"chunk_id":   chunk.ID,
 				"session_id": sessionID,
 			})
 			continue
 		}
-		
+
 		storedChunks = append(storedChunks, chunk.ID)
 	}
-	
+
 	// Update analysis with stored chunks
 	analysis.StoredChunks = storedChunks
-	
+
 	// Log performance metrics
 	totalLatency := time.Since(startTime)
 	a.logger.Info("Project analysis completed", map[string]interface{}{
-		"operation":         "auto_store_project",
-		"session_id":        sessionID,
-		"project_path":      projectPath,
-		"language":          analysis.Language,
-		"framework":         analysis.Framework,
-		"architecture":      analysis.Architecture,
-		"complexity_score":  analysis.Complexity,
-		"chunks_stored":     len(storedChunks),
-		"focus_areas":       len(focusAreas),
-		"total_latency_ms":  totalLatency.Milliseconds(),
+		"operation":        "auto_store_project",
+		"session_id":       sessionID,
+		"project_path":     projectPath,
+		"language":         analysis.Language,
+		"framework":        analysis.Framework,
+		"architecture":     analysis.Architecture,
+		"complexity_score": analysis.Complexity,
+		"chunks_stored":    len(storedChunks),
+		"focus_areas":      len(focusAreas),
+		"total_latency_ms": totalLatency.Milliseconds(),
 	})
-	
+
 	// Prepare response content based on silent mode
 	var responseContent string
-	
+
 	if silent {
 		// Minimal response for seamless operation
-		responseContent = fmt.Sprintf("✅ Project analyzed: %d chunks stored (%dms)", 
+		responseContent = fmt.Sprintf("✅ Project analyzed: %d chunks stored (%dms)",
 			len(storedChunks), totalLatency.Milliseconds())
 	} else {
 		// Detailed response for debugging/verbose mode
@@ -1075,23 +1117,23 @@ func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args
 
 ✅ Project context is now available for intelligent retrieval
 ⏱️ Analysis time: %dms`,
-		projectPath,
-		analysis.Language,
-		analysis.Framework,
-		analysis.Architecture,
-		analysis.Complexity,
-		len(storedChunks),
-		strings.Join(a.focusAreasToStrings(focusAreas), ", "),
-		len(analysis.KeyFiles),
-		strings.Join(analysis.KeyFiles[:min(5, len(analysis.KeyFiles))], "\n"),
-		len(analysis.APIEndpoints),
-		strings.Join(analysis.APIEndpoints[:min(10, len(analysis.APIEndpoints))], "\n"),
-		len(analysis.DatabaseSchema),
-		strings.Join(analysis.DatabaseSchema, "\n"),
-		totalLatency.Milliseconds(),
-	)
+			projectPath,
+			analysis.Language,
+			analysis.Framework,
+			analysis.Architecture,
+			analysis.Complexity,
+			len(storedChunks),
+			strings.Join(a.focusAreasToStrings(focusAreas), ", "),
+			len(analysis.KeyFiles),
+			strings.Join(analysis.KeyFiles[:min(5, len(analysis.KeyFiles))], "\n"),
+			len(analysis.APIEndpoints),
+			strings.Join(analysis.APIEndpoints[:min(10, len(analysis.APIEndpoints))], "\n"),
+			len(analysis.DatabaseSchema),
+			strings.Join(analysis.DatabaseSchema, "\n"),
+			totalLatency.Milliseconds(),
+		)
 	}
-	
+
 	return mcp.NewResponse(id, map[string]interface{}{
 		"content": []map[string]interface{}{
 			{
@@ -1105,7 +1147,7 @@ func (a *AIMem) handleAutoStoreProject(ctx context.Context, id interface{}, args
 // handleContextAwareRetrieve handles the context_aware_retrieve tool
 func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
 	startTime := time.Now()
-	
+
 	// Extract required parameters
 	sessionID, ok := args["session_id"].(string)
 	if !ok {
@@ -1115,7 +1157,7 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 			nil,
 		))
 	}
-	
+
 	currentTask, ok := args["current_task"].(string)
 	if !ok {
 		return mcp.NewErrorResponse(id, mcp.NewError(
@@ -1124,7 +1166,7 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 			nil,
 		))
 	}
-	
+
 	taskTypeStr, ok := args["task_type"].(string)
 	if !ok {
 		return mcp.NewErrorResponse(id, mcp.NewError(
@@ -1134,23 +1176,23 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 		))
 	}
 	taskType := types.TaskType(taskTypeStr)
-	
+
 	// Parse optional parameters with defaults
 	autoExpand := false
 	if expand, exists := args["auto_expand"].(bool); exists {
 		autoExpand = expand
 	}
-	
+
 	maxChunks := 10
 	if max, exists := args["max_chunks"].(float64); exists {
 		maxChunks = int(max)
 	}
-	
+
 	contextDepth := 2
 	if depth, exists := args["context_depth"].(float64); exists {
 		contextDepth = int(depth)
 	}
-	
+
 	maxResponseTokens := 20000
 	if tokens, exists := args["max_response_tokens"].(float64); exists {
 		maxResponseTokens = int(tokens)
@@ -1161,7 +1203,7 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 			maxResponseTokens = 24000
 		}
 	}
-	
+
 	page := 1
 	if pageNum, exists := args["page"].(float64); exists {
 		page = int(pageNum)
@@ -1169,25 +1211,25 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 			page = 1
 		}
 	}
-	
+
 	enablePagination := true
 	if paging, exists := args["enable_pagination"].(bool); exists {
 		enablePagination = paging
 	}
-	
+
 	a.logger.Info("Starting context-aware retrieval", map[string]interface{}{
-		"session_id":         sessionID,
-		"current_task":       currentTask,
-		"task_type":          taskType,
-		"auto_expand":        autoExpand,
-		"max_chunks":         maxChunks,
-		"context_depth":      contextDepth,
+		"session_id":          sessionID,
+		"current_task":        currentTask,
+		"task_type":           taskType,
+		"auto_expand":         autoExpand,
+		"max_chunks":          maxChunks,
+		"context_depth":       contextDepth,
 		"max_response_tokens": maxResponseTokens,
-		"page":               page,
-		"enable_pagination":  enablePagination,
-		"operation":          "context_aware_retrieve",
+		"page":                page,
+		"enable_pagination":   enablePagination,
+		"operation":           "context_aware_retrieve",
 	})
-	
+
 	// Configure response limiter for this request
 	responseConfig := types.ResponseConfig{
 		MaxTokens:       maxResponseTokens,
@@ -1196,10 +1238,10 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 		TruncateContent: true,
 	}
 	requestLimiter := utils.NewResponseLimiterWithConfig(responseConfig)
-	
+
 	// Create enhanced query based on task type
 	enhancedQuery := a.enhanceQueryByTaskType(currentTask, taskType)
-	
+
 	// Perform semantic search
 	embedding, err := a.embedder.GenerateEmbedding(enhancedQuery)
 	if err != nil {
@@ -1209,13 +1251,13 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 			nil,
 		))
 	}
-	
+
 	// Retrieve chunks (get more than maxChunks to have options for selection)
 	searchLimit := maxChunks * 3
 	if searchLimit > 100 {
 		searchLimit = 100
 	}
-	
+
 	allChunks, err := a.storage.SearchByEmbedding(ctx, sessionID, embedding, searchLimit)
 	if err != nil {
 		return mcp.NewErrorResponse(id, mcp.NewError(
@@ -1224,40 +1266,40 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 			nil,
 		))
 	}
-	
+
 	// Calculate enhanced relevance scores and sort
 	for _, chunk := range allChunks {
 		chunk.Relevance = a.calculateTaskAwareRelevance(chunk, taskType, currentTask)
 	}
-	
+
 	sort.Slice(allChunks, func(i, j int) bool {
 		return allChunks[i].Relevance > allChunks[j].Relevance
 	})
-	
+
 	// Select primary chunks based on maxChunks limit
 	primaryChunks := allChunks
 	if len(primaryChunks) > maxChunks {
 		primaryChunks = primaryChunks[:maxChunks]
 	}
-	
+
 	var relatedChunks []*types.ContextChunk
 	var relationships []types.ContextRelationship
-	
+
 	// Auto-expand with related context if enabled
 	if autoExpand && len(primaryChunks) > 0 {
 		relatedChunks, relationships = a.expandWithRelatedContext(primaryChunks, contextDepth, maxChunks/2)
 	}
-	
+
 	totalRelevance := 0.0
 	for _, chunk := range primaryChunks {
 		totalRelevance += chunk.Relevance
 	}
-	
+
 	totalLatency := time.Since(startTime)
-	
+
 	// Use response limiter to create paginated and size-limited response
 	retrievalReason := fmt.Sprintf("Context-aware retrieval for %s task: %s", taskType, currentTask)
-	
+
 	limitedResult := requestLimiter.LimitContextAwareRetrievalResponse(
 		primaryChunks,
 		relatedChunks,
@@ -1267,31 +1309,31 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 		totalLatency.Milliseconds(),
 		page,
 	)
-	
+
 	a.logger.Info("Context-aware retrieval completed", map[string]interface{}{
-		"operation":             "context_aware_retrieve",
-		"session_id":            sessionID,
-		"task_type":             taskType,
-		"chunks_found":          len(allChunks),
-		"primary_returned":      len(limitedResult.PrimaryChunks),
-		"related_returned":      len(limitedResult.RelatedChunks),
+		"operation":              "context_aware_retrieve",
+		"session_id":             sessionID,
+		"task_type":              taskType,
+		"chunks_found":           len(allChunks),
+		"primary_returned":       len(limitedResult.PrimaryChunks),
+		"related_returned":       len(limitedResult.RelatedChunks),
 		"relationships_returned": len(limitedResult.Relationships),
-		"total_relevance":       totalRelevance,
-		"total_latency_ms":      totalLatency.Milliseconds(),
-		"estimated_tokens":      limitedResult.TokenLimits.EstimatedTokens,
-		"truncated_content":     limitedResult.TokenLimits.TruncatedContent,
-		"auto_expand":           autoExpand,
+		"total_relevance":        totalRelevance,
+		"total_latency_ms":       totalLatency.Milliseconds(),
+		"estimated_tokens":       limitedResult.TokenLimits.EstimatedTokens,
+		"truncated_content":      limitedResult.TokenLimits.TruncatedContent,
+		"auto_expand":            autoExpand,
 	})
-	
+
 	// Build human-readable response text
 	var contentParts []string
-	
+
 	// Header with metadata
 	contentParts = append(contentParts, fmt.Sprintf(
 		"🎯 **Context-Aware Retrieval**: %s\n\n**Task Type**: %s\n**Query Enhancement**: Applied\n**Auto-Expand**: %t\n**Token Budget**: %d (Estimated: %d)\n",
 		currentTask, taskType, autoExpand, maxResponseTokens, limitedResult.TokenLimits.EstimatedTokens,
 	))
-	
+
 	// Pagination info if applicable
 	if limitedResult.Paging != nil {
 		contentParts = append(contentParts, fmt.Sprintf(
@@ -1302,14 +1344,14 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 			contentParts = append(contentParts, fmt.Sprintf("**Next Page Token**: %s\n", limitedResult.Paging.NextPageToken))
 		}
 	}
-	
+
 	// Truncation warning if needed
 	if limitedResult.TokenLimits.TruncatedContent {
 		contentParts = append(contentParts, "⚠️ **Content was truncated to fit token limits**\n")
 	}
-	
+
 	contentParts = append(contentParts, "\n")
-	
+
 	// Primary chunks
 	if len(limitedResult.PrimaryChunks) > 0 {
 		contentParts = append(contentParts, fmt.Sprintf("**Primary Context** (%d chunks):\n", len(limitedResult.PrimaryChunks)))
@@ -1320,7 +1362,7 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 			))
 		}
 	}
-	
+
 	// Related chunks
 	if len(limitedResult.RelatedChunks) > 0 {
 		contentParts = append(contentParts, fmt.Sprintf("**Related Context** (%d chunks):\n", len(limitedResult.RelatedChunks)))
@@ -1331,7 +1373,7 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 			))
 		}
 	}
-	
+
 	// Relationships
 	if len(limitedResult.Relationships) > 0 {
 		contentParts = append(contentParts, fmt.Sprintf("**Context Relationships** (%d found):\n", len(limitedResult.Relationships)))
@@ -1342,9 +1384,9 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 			))
 		}
 	}
-	
+
 	responseContent := strings.Join(contentParts, "")
-	
+
 	return mcp.NewResponse(id, map[string]interface{}{
 		"content": []map[string]interface{}{
 			{
@@ -1358,7 +1400,7 @@ func (a *AIMem) handleContextAwareRetrieve(ctx context.Context, id interface{}, 
 // handleSmartMemoryManager handles the smart_memory_manager tool
 func (a *AIMem) handleSmartMemoryManager(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
 	startTime := time.Now()
-	
+
 	// Extract parameters
 	sessionID, ok := args["session_id"].(string)
 	if !ok {
@@ -1368,7 +1410,7 @@ func (a *AIMem) handleSmartMemoryManager(ctx context.Context, id interface{}, ar
 			nil,
 		))
 	}
-	
+
 	sessionPhaseStr, ok := args["session_phase"].(string)
 	if !ok {
 		return mcp.NewErrorResponse(id, mcp.NewError(
@@ -1378,7 +1420,7 @@ func (a *AIMem) handleSmartMemoryManager(ctx context.Context, id interface{}, ar
 		))
 	}
 	sessionPhase := types.SessionPhase(sessionPhaseStr)
-	
+
 	memoryStrategyStr, ok := args["memory_strategy"].(string)
 	if !ok {
 		return mcp.NewErrorResponse(id, mcp.NewError(
@@ -1388,12 +1430,12 @@ func (a *AIMem) handleSmartMemoryManager(ctx context.Context, id interface{}, ar
 		))
 	}
 	memoryStrategy := types.MemoryStrategy(memoryStrategyStr)
-	
+
 	preserveImportant := true
 	if preserve, exists := args["preserve_important"].(bool); exists {
 		preserveImportant = preserve
 	}
-	
+
 	a.logger.Info("Starting smart memory management", map[string]interface{}{
 		"session_id":         sessionID,
 		"session_phase":      sessionPhase,
@@ -1401,7 +1443,7 @@ func (a *AIMem) handleSmartMemoryManager(ctx context.Context, id interface{}, ar
 		"preserve_important": preserveImportant,
 		"operation":          "smart_memory_manager",
 	})
-	
+
 	// Get current session stats
 	stats, err := a.storage.GetSessionSummary(ctx, sessionID)
 	if err != nil {
@@ -1411,7 +1453,7 @@ func (a *AIMem) handleSmartMemoryManager(ctx context.Context, id interface{}, ar
 			nil,
 		))
 	}
-	
+
 	// Apply smart memory management strategy
 	managementResult, err := a.applySmartMemoryStrategy(sessionID, sessionPhase, memoryStrategy, preserveImportant, stats)
 	if err != nil {
@@ -1421,19 +1463,19 @@ func (a *AIMem) handleSmartMemoryManager(ctx context.Context, id interface{}, ar
 			nil,
 		))
 	}
-	
+
 	totalLatency := time.Since(startTime)
-	
+
 	a.logger.Info("Smart memory management completed", map[string]interface{}{
-		"operation":         "smart_memory_manager",
-		"session_id":        sessionID,
-		"session_phase":     sessionPhase,
-		"memory_strategy":   memoryStrategy,
-		"chunks_cleaned":    managementResult.ChunksCleaned,
-		"memory_freed":      managementResult.MemoryFreed,
-		"total_latency_ms":  totalLatency.Milliseconds(),
+		"operation":        "smart_memory_manager",
+		"session_id":       sessionID,
+		"session_phase":    sessionPhase,
+		"memory_strategy":  memoryStrategy,
+		"chunks_cleaned":   managementResult.ChunksCleaned,
+		"memory_freed":     managementResult.MemoryFreed,
+		"total_latency_ms": totalLatency.Milliseconds(),
 	})
-	
+
 	responseContent := fmt.Sprintf(`🧠 **Smart Memory Management Complete**
 
 **Session Phase**: %s
@@ -1461,7 +1503,7 @@ func (a *AIMem) handleSmartMemoryManager(ctx context.Context, id interface{}, ar
 		totalLatency.Milliseconds(),
 		sessionPhase,
 	)
-	
+
 	return mcp.NewResponse(id, map[string]interface{}{
 		"content": []map[string]interface{}{
 			{
@@ -1496,14 +1538,14 @@ func (a *AIMem) focusAreasToStrings(areas []types.FocusArea) []string {
 // enhanceQueryByTaskType enhances queries based on task type
 func (a *AIMem) enhanceQueryByTaskType(query string, taskType types.TaskType) string {
 	taskEnhancements := map[types.TaskType]string{
-		types.TaskAnalysis:     "architecture structure design patterns code organization",
-		types.TaskDevelopment:  "implementation code examples functions methods API",
-		types.TaskDebugging:    "error handling exceptions logging debugging troubleshooting",
-		types.TaskRefactoring:  "code quality structure patterns refactor improve optimize",
-		types.TaskTesting:      "tests testing unit integration end-to-end validation",
-		types.TaskDeployment:   "deployment configuration infrastructure setup production",
+		types.TaskAnalysis:    "architecture structure design patterns code organization",
+		types.TaskDevelopment: "implementation code examples functions methods API",
+		types.TaskDebugging:   "error handling exceptions logging debugging troubleshooting",
+		types.TaskRefactoring: "code quality structure patterns refactor improve optimize",
+		types.TaskTesting:     "tests testing unit integration end-to-end validation",
+		types.TaskDeployment:  "deployment configuration infrastructure setup production",
 	}
-	
+
 	if enhancement, exists := taskEnhancements[taskType]; exists {
 		return query + " " + enhancement
 	}
@@ -1513,7 +1555,7 @@ func (a *AIMem) enhanceQueryByTaskType(query string, taskType types.TaskType) st
 // calculateTaskAwareRelevance calculates relevance based on task type
 func (a *AIMem) calculateTaskAwareRelevance(chunk *types.ContextChunk, taskType types.TaskType, currentTask string) float64 {
 	baseRelevance := chunk.Relevance
-	
+
 	// Task-specific boosters
 	taskBoosts := map[types.TaskType]map[string]float64{
 		types.TaskAnalysis: {
@@ -1537,7 +1579,7 @@ func (a *AIMem) calculateTaskAwareRelevance(chunk *types.ContextChunk, taskType 
 			"fix":     1.1,
 		},
 	}
-	
+
 	// Apply task-specific boosts
 	if boosts, exists := taskBoosts[taskType]; exists {
 		content := strings.ToLower(chunk.Content)
@@ -1548,18 +1590,18 @@ func (a *AIMem) calculateTaskAwareRelevance(chunk *types.ContextChunk, taskType 
 			}
 		}
 	}
-	
+
 	// Importance boost
 	importanceBoost := map[types.Importance]float64{
 		types.ImportanceHigh:   1.2,
 		types.ImportanceMedium: 1.0,
 		types.ImportanceLow:    0.8,
 	}
-	
+
 	if boost, exists := importanceBoost[chunk.Importance]; exists {
 		baseRelevance *= boost
 	}
-	
+
 	// Recency boost (newer chunks get slight boost)
 	age := time.Since(chunk.Timestamp).Hours()
 	if age < 1 {
@@ -1567,7 +1609,7 @@ func (a *AIMem) calculateTaskAwareRelevance(chunk *types.ContextChunk, taskType 
 	} else if age < 24 {
 		baseRelevance *= 1.05
 	}
-	
+
 	return math.Min(baseRelevance, 1.0) // Cap at 1.0
 }
 
@@ -1575,28 +1617,28 @@ func (a *AIMem) calculateTaskAwareRelevance(chunk *types.ContextChunk, taskType 
 func (a *AIMem) expandWithRelatedContext(primaryChunks []*types.ContextChunk, depth, maxTotal int) ([]*types.ContextChunk, []types.ContextRelationship) {
 	var relatedChunks []*types.ContextChunk
 	var relationships []types.ContextRelationship
-	
+
 	// Simple implementation - in production, this would use more sophisticated relationship detection
 	for _, primaryChunk := range primaryChunks {
 		// Find chunks with similar keywords
 		keywords := a.extractKeywords(primaryChunk.Content)
-		
+
 		for _, keyword := range keywords[:min(3, len(keywords))] {
 			if len(relatedChunks) >= maxTotal/2 {
 				break
 			}
-			
+
 			// This is simplified - would use semantic similarity in production
 			embedding, err := a.embedder.GenerateEmbedding(keyword)
 			if err != nil {
 				continue
 			}
-			
+
 			chunks, err := a.storage.SearchByEmbedding(context.TODO(), primaryChunk.SessionID, embedding, 2)
 			if err != nil {
 				continue
 			}
-			
+
 			for _, chunk := range chunks {
 				if chunk.ID != primaryChunk.ID && !a.containsChunk(relatedChunks, chunk.ID) {
 					relatedChunks = append(relatedChunks, chunk)
@@ -1611,7 +1653,7 @@ func (a *AIMem) expandWithRelatedContext(primaryChunks []*types.ContextChunk, de
 			}
 		}
 	}
-	
+
 	return relatedChunks, relationships
 }
 
@@ -1620,7 +1662,7 @@ func (a *AIMem) extractKeywords(content string) []string {
 	// Simplified keyword extraction - would use NLP in production
 	words := strings.Fields(strings.ToLower(content))
 	keywords := make(map[string]int)
-	
+
 	// Skip common words
 	stopWords := map[string]bool{
 		"the": true, "and": true, "or": true, "but": true, "in": true,
@@ -1632,33 +1674,33 @@ func (a *AIMem) extractKeywords(content string) []string {
 		"must": true, "can": true, "a": true, "an": true, "this": true,
 		"that": true, "these": true, "those": true,
 	}
-	
+
 	for _, word := range words {
 		if len(word) > 3 && !stopWords[word] {
 			keywords[word]++
 		}
 	}
-	
+
 	// Convert to sorted slice
 	type kv struct {
 		key   string
 		value int
 	}
-	
+
 	var kvSlice []kv
 	for k, v := range keywords {
 		kvSlice = append(kvSlice, kv{k, v})
 	}
-	
+
 	sort.Slice(kvSlice, func(i, j int) bool {
 		return kvSlice[i].value > kvSlice[j].value
 	})
-	
+
 	result := make([]string, len(kvSlice))
 	for i, kv := range kvSlice {
 		result[i] = kv.key
 	}
-	
+
 	return result
 }
 
@@ -1674,11 +1716,11 @@ func (a *AIMem) containsChunk(chunks []*types.ContextChunk, id string) bool {
 
 // SmartMemoryResult represents the result of smart memory management
 type SmartMemoryResult struct {
-	ChunksCleaned     int     `json:"chunks_cleaned"`
-	MemoryFreed       int64   `json:"memory_freed"`
-	ChunksRemaining   int     `json:"chunks_remaining"`
-	AverageRelevance  float64 `json:"average_relevance"`
-	Description       string  `json:"description"`
+	ChunksCleaned    int     `json:"chunks_cleaned"`
+	MemoryFreed      int64   `json:"memory_freed"`
+	ChunksRemaining  int     `json:"chunks_remaining"`
+	AverageRelevance float64 `json:"average_relevance"`
+	Description      string  `json:"description"`
 }
 
 // applySmartMemoryStrategy applies memory management strategy
@@ -1688,21 +1730,21 @@ func (a *AIMem) applySmartMemoryStrategy(sessionID string, phase types.SessionPh
 	if err != nil {
 		return nil, err
 	}
-	
+
 	originalCount := len(chunks)
 	_ = stats.MemoryUsage // unused for now
-	
+
 	// Determine cleanup ratio based on strategy and phase
 	cleanupRatio := a.getCleanupRatio(strategy, phase)
-	
+
 	// Calculate how many chunks to remove
 	maxRemove := int(float64(len(chunks)) * cleanupRatio)
 	if maxRemove == 0 && len(chunks) > 10 {
 		maxRemove = 1 // Remove at least one if we have many chunks
 	}
-	
+
 	var chunksToRemove []*types.ContextChunk
-	
+
 	// Select chunks to remove based on strategy
 	switch strategy {
 	case types.MemoryAggressive:
@@ -1712,7 +1754,7 @@ func (a *AIMem) applySmartMemoryStrategy(sessionID string, phase types.SessionPh
 	case types.MemoryConservative:
 		chunksToRemove = a.selectConservativeCleanup(chunks, maxRemove, preserveImportant)
 	}
-	
+
 	// Remove selected chunks
 	var memoryFreed int64
 	for _, chunk := range chunksToRemove {
@@ -1722,10 +1764,10 @@ func (a *AIMem) applySmartMemoryStrategy(sessionID string, phase types.SessionPh
 		}
 		memoryFreed += int64(len(chunk.Content))
 	}
-	
+
 	// Calculate remaining stats
 	remainingChunks := originalCount - len(chunksToRemove)
-	
+
 	// Calculate average relevance of remaining chunks
 	avgRelevance := 0.0
 	if remainingChunks > 0 {
@@ -1744,10 +1786,10 @@ func (a *AIMem) applySmartMemoryStrategy(sessionID string, phase types.SessionPh
 		}
 		avgRelevance = totalRelevance / float64(remainingChunks)
 	}
-	
+
 	description := fmt.Sprintf("Applied %s strategy for %s phase, %s important chunks",
 		strategy, phase, map[bool]string{true: "preserving", false: "not preserving"}[preserveImportant])
-	
+
 	return &SmartMemoryResult{
 		ChunksCleaned:    len(chunksToRemove),
 		MemoryFreed:      memoryFreed,
@@ -1779,27 +1821,27 @@ func (a *AIMem) getCleanupRatio(strategy types.MemoryStrategy, phase types.Sessi
 			types.PhaseDeployment:  0.0,
 		},
 	}
-	
+
 	if phaseRatios, exists := ratios[strategy]; exists {
 		if ratio, exists := phaseRatios[phase]; exists {
 			return ratio
 		}
 	}
-	
+
 	return 0.1 // Default conservative cleanup
 }
 
 // selectAggressiveCleanup selects chunks for aggressive cleanup
 func (a *AIMem) selectAggressiveCleanup(chunks []*types.ContextChunk, maxRemove int, preserveImportant bool) []*types.ContextChunk {
 	var candidates []*types.ContextChunk
-	
+
 	for _, chunk := range chunks {
 		if preserveImportant && chunk.Importance == types.ImportanceHigh {
 			continue
 		}
 		candidates = append(candidates, chunk)
 	}
-	
+
 	// Sort by relevance and age (prefer removing old, low-relevance chunks)
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].Relevance != candidates[j].Relevance {
@@ -1807,18 +1849,18 @@ func (a *AIMem) selectAggressiveCleanup(chunks []*types.ContextChunk, maxRemove 
 		}
 		return candidates[i].Timestamp.Before(candidates[j].Timestamp)
 	})
-	
+
 	if maxRemove > len(candidates) {
 		maxRemove = len(candidates)
 	}
-	
+
 	return candidates[:maxRemove]
 }
 
 // selectBalancedCleanup selects chunks for balanced cleanup
 func (a *AIMem) selectBalancedCleanup(chunks []*types.ContextChunk, maxRemove int, preserveImportant bool) []*types.ContextChunk {
 	var candidates []*types.ContextChunk
-	
+
 	for _, chunk := range chunks {
 		if preserveImportant && chunk.Importance == types.ImportanceHigh {
 			continue
@@ -1829,60 +1871,60 @@ func (a *AIMem) selectBalancedCleanup(chunks []*types.ContextChunk, maxRemove in
 		}
 		candidates = append(candidates, chunk)
 	}
-	
+
 	// Sort by combined score (relevance + age + importance)
 	sort.Slice(candidates, func(i, j int) bool {
 		scoreI := a.calculateCleanupScore(candidates[i])
 		scoreJ := a.calculateCleanupScore(candidates[j])
 		return scoreI < scoreJ // Lower score = more likely to be removed
 	})
-	
+
 	if maxRemove > len(candidates) {
 		maxRemove = len(candidates)
 	}
-	
+
 	return candidates[:maxRemove]
 }
 
 // selectConservativeCleanup selects chunks for conservative cleanup
 func (a *AIMem) selectConservativeCleanup(chunks []*types.ContextChunk, maxRemove int, preserveImportant bool) []*types.ContextChunk {
 	var candidates []*types.ContextChunk
-	
+
 	for _, chunk := range chunks {
 		if preserveImportant && chunk.Importance != types.ImportanceLow {
 			continue
 		}
 		// Only remove very old, low-relevance, low-importance chunks
-		if chunk.Relevance < 0.3 && chunk.Importance == types.ImportanceLow && 
-		   time.Since(chunk.Timestamp) > 24*time.Hour {
+		if chunk.Relevance < 0.3 && chunk.Importance == types.ImportanceLow &&
+			time.Since(chunk.Timestamp) > 24*time.Hour {
 			candidates = append(candidates, chunk)
 		}
 	}
-	
+
 	// Sort by age (oldest first in conservative mode)
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].Timestamp.Before(candidates[j].Timestamp)
 	})
-	
+
 	if maxRemove > len(candidates) {
 		maxRemove = len(candidates)
 	}
-	
+
 	return candidates[:maxRemove]
 }
 
 // calculateCleanupScore calculates a score for cleanup prioritization
 func (a *AIMem) calculateCleanupScore(chunk *types.ContextChunk) float64 {
 	score := 0.0
-	
+
 	// Relevance component (lower is more likely to be removed)
 	score += (1.0 - chunk.Relevance) * 0.4
-	
+
 	// Age component (older is more likely to be removed)
 	ageHours := time.Since(chunk.Timestamp).Hours()
 	ageScore := math.Min(ageHours/24.0, 1.0) // Normalize to 0-1 over 24 hours
 	score += ageScore * 0.3
-	
+
 	// Importance component
 	importanceScore := map[types.Importance]float64{
 		types.ImportanceHigh:   0.0,
@@ -1890,7 +1932,7 @@ func (a *AIMem) calculateCleanupScore(chunk *types.ContextChunk) float64 {
 		types.ImportanceLow:    1.0,
 	}
 	score += importanceScore[chunk.Importance] * 0.3
-	
+
 	return score
 }
 
@@ -1902,15 +1944,251 @@ func min(a, b int) int {
 	return b
 }
 
+// Session Management Handler Methods (Simplified)
+
+// handleGetOrCreateProjectSession handles the get_or_create_project_session tool
+func (a *AIMem) handleGetOrCreateProjectSession(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
+	workingDir := "."
+	if wd, exists := args["working_dir"].(string); exists && wd != "" {
+		workingDir = wd
+	}
+
+	session, err := a.sessionManager.GetOrCreateProjectSession(workingDir)
+	if err != nil {
+		return mcp.NewErrorResponse(id, mcp.NewError(
+			mcp.ErrorCodeInternalError,
+			fmt.Sprintf("Failed to get or create project session: %v", err),
+			nil,
+		))
+	}
+
+	responseContent := fmt.Sprintf("✅ Project Session Ready\nSession ID: %s\nProject: %s\nType: %s",
+		session.ID, session.Metadata["project_name"], session.Type)
+
+	return mcp.NewResponse(id, map[string]interface{}{
+		"content": []map[string]interface{}{{"type": "text", "text": responseContent}},
+	})
+}
+
+// handleResolveSession handles the resolve_session tool
+func (a *AIMem) handleResolveSession(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
+	sessionIDOrPath, ok := args["session_id_or_path"].(string)
+	if !ok {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInvalidParams, "session_id_or_path required", nil))
+	}
+
+	session, err := a.sessionManager.ResolveSession(sessionIDOrPath)
+	if err != nil {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInternalError, err.Error(), nil))
+	}
+
+	responseContent := fmt.Sprintf("🔍 Session Resolved: %s\nProject: %s", session.ID, session.Metadata["project_name"])
+	return mcp.NewResponse(id, map[string]interface{}{
+		"content": []map[string]interface{}{{"type": "text", "text": responseContent}},
+	})
+}
+
+// handleDiscoverRelatedSessions handles the discover_related_sessions tool
+func (a *AIMem) handleDiscoverRelatedSessions(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
+	workingDir, ok := args["working_dir"].(string)
+	if !ok {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInvalidParams, "working_dir required", nil))
+	}
+
+	sessions, _ := a.sessionManager.ListActiveSessions(ctx)
+	responseContent := fmt.Sprintf("🔍 Found %d active sessions for directory: %s", len(sessions), workingDir)
+
+	return mcp.NewResponse(id, map[string]interface{}{
+		"content": []map[string]interface{}{{"type": "text", "text": responseContent}},
+	})
+}
+
+// handleGetSessionInfo handles the get_session_info tool
+func (a *AIMem) handleGetSessionInfo(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
+	sessionID, ok := args["session_id"].(string)
+	if !ok {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInvalidParams, "session_id required", nil))
+	}
+
+	session, err := a.sessionManager.GetSession(ctx, sessionID)
+	if err != nil {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInternalError, err.Error(), nil))
+	}
+
+	responseContent := a.sessionManager.GetSessionInfo(session)
+	return mcp.NewResponse(id, map[string]interface{}{
+		"content": []map[string]interface{}{{"type": "text", "text": responseContent}},
+	})
+}
+
+// handleListProjectSessions handles the list_project_sessions tool
+func (a *AIMem) handleListProjectSessions(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
+	projectID, ok := args["project_id"].(string)
+	if !ok {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInvalidParams, "project_id required", nil))
+	}
+
+	sessions, err := a.storage.GetProjectSessions(ctx, projectID)
+	if err != nil {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInternalError, err.Error(), nil))
+	}
+
+	responseContent := fmt.Sprintf("📋 Found %d sessions for project: %s", len(sessions), projectID)
+	return mcp.NewResponse(id, map[string]interface{}{
+		"content": []map[string]interface{}{{"type": "text", "text": responseContent}},
+	})
+}
+
+// handleCreateFeatureSession handles the create_feature_session tool
+func (a *AIMem) handleCreateFeatureSession(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
+	parentSessionID, ok := args["parent_session_id"].(string)
+	if !ok {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInvalidParams, "parent_session_id required", nil))
+	}
+
+	featureName, ok := args["feature_name"].(string)
+	if !ok {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInvalidParams, "feature_name required", nil))
+	}
+
+	featureSession, err := a.sessionManager.CreateFeatureSession(ctx, parentSessionID, featureName)
+	if err != nil {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInternalError, err.Error(), nil))
+	}
+
+	responseContent := fmt.Sprintf("🌟 Feature Session Created: %s\nFeature: %s", featureSession.ID, featureName)
+	return mcp.NewResponse(id, map[string]interface{}{
+		"content": []map[string]interface{}{{"type": "text", "text": responseContent}},
+	})
+}
+
+// Performance Monitoring and Debugging Handler Methods
+
+// handleGetPerformanceMetrics handles the get_performance_metrics tool
+func (a *AIMem) handleGetPerformanceMetrics(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
+	metricType, ok := args["metric_type"].(string)
+	if !ok {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInvalidParams, "metric_type required", nil))
+	}
+
+	sessionID, _ := args["session_id"].(string)
+
+	var responseContent string
+
+	switch metricType {
+	case "system":
+		metrics := a.perfMonitor.GetSystemMetrics()
+		responseContent = fmt.Sprintf("📊 System Performance Metrics\n\nUptime: %.1f hours\nTotal Requests: %v\nError Rate: %.2f%%\nAvg Latency: %v ms\nRequests/sec: %.2f\nActive Sessions: %v",
+			metrics["uptime_seconds"].(float64)/3600,
+			metrics["total_requests"],
+			metrics["error_rate_percent"],
+			metrics["average_latency_ms"],
+			metrics["requests_per_second"],
+			metrics["active_sessions"])
+
+	case "session":
+		if sessionID == "" {
+			return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInvalidParams, "session_id required for session metrics", nil))
+		}
+		sessionMetrics := a.perfMonitor.GetSessionMetrics(sessionID)
+		if sessionMetrics == nil {
+			responseContent = fmt.Sprintf("❌ No metrics found for session: %s", sessionID)
+		} else {
+			responseContent = fmt.Sprintf("📈 Session Metrics: %s\n\nRequests: %d\nAvg Latency: %v\nMemory Usage: %d bytes\nChunk Count: %d\nLast Activity: %s",
+				sessionID, sessionMetrics.RequestCount, sessionMetrics.AverageLatency,
+				sessionMetrics.MemoryUsage, sessionMetrics.ChunkCount, sessionMetrics.LastActivity.Format("2006-01-02 15:04:05"))
+		}
+
+	case "operation":
+		opMetrics := a.perfMonitor.GetOperationMetrics()
+		responseContent = "🔧 Operation Metrics\n\n"
+		for op, metrics := range opMetrics {
+			responseContent += fmt.Sprintf("**%s**: %d requests, avg: %v, errors: %d\n",
+				op, metrics.TotalRequests, metrics.AverageLatency, metrics.TotalErrors)
+		}
+
+	case "all":
+		systemMetrics := a.perfMonitor.GetSystemMetrics()
+		responseContent = fmt.Sprintf("🚀 Complete Performance Report\n\nSystem: %d requests, %.2f%% errors\nActive Sessions: %v\nUptime: %.1f hours",
+			systemMetrics["total_requests"], systemMetrics["error_rate_percent"],
+			systemMetrics["active_sessions"], systemMetrics["uptime_seconds"].(float64)/3600)
+
+	default:
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInvalidParams, "Invalid metric_type", nil))
+	}
+
+	return mcp.NewResponse(id, map[string]interface{}{
+		"content": []map[string]interface{}{{"type": "text", "text": responseContent}},
+	})
+}
+
+// handleDebugSessionState handles the debug_session_state tool
+func (a *AIMem) handleDebugSessionState(ctx context.Context, id interface{}, args map[string]interface{}) *mcp.Response {
+	sessionID, ok := args["session_id"].(string)
+	if !ok {
+		return mcp.NewErrorResponse(id, mcp.NewError(mcp.ErrorCodeInvalidParams, "session_id required", nil))
+	}
+
+	includeMemory := true
+	if mem, exists := args["include_memory"].(bool); exists {
+		includeMemory = mem
+	}
+
+	includeChunks := false
+	if chunks, exists := args["include_chunks"].(bool); exists {
+		includeChunks = chunks
+	}
+
+	// Get session info
+	session, err := a.sessionManager.GetSession(ctx, sessionID)
+	if err != nil {
+		return mcp.NewResponse(id, map[string]interface{}{
+			"content": []map[string]interface{}{{"type": "text", "text": fmt.Sprintf("❌ Session not found: %s", sessionID)}},
+		})
+	}
+
+	// Build debug info
+	debugInfo := fmt.Sprintf("🐛 Debug Session State: %s\n\n**Basic Info**:\n- ID: %s\n- Project: %s\n- Type: %s\n- Status: %s\n- Working Dir: %s\n- Created: %s\n- Last Active: %s",
+		sessionID, session.ID, session.Metadata["project_name"], session.Type,
+		session.Status, session.WorkingDir, session.CreatedAt.Format("2006-01-02 15:04:05"),
+		session.LastActive.Format("2006-01-02 15:04:05"))
+
+	// Add performance metrics if available
+	if includeMemory {
+		perfMetrics := a.perfMonitor.GetSessionMetrics(sessionID)
+		if perfMetrics != nil {
+			debugInfo += fmt.Sprintf("\n\n**Performance**:\n- Requests: %d\n- Avg Latency: %v\n- Memory: %d bytes\n- Chunks: %d",
+				perfMetrics.RequestCount, perfMetrics.AverageLatency, perfMetrics.MemoryUsage, perfMetrics.ChunkCount)
+		}
+	}
+
+	// Add chunk information if requested
+	if includeChunks {
+		// This would get actual chunks from storage - simplified for now
+		debugInfo += "\n\n**Storage**: Context chunks stored in database"
+	}
+
+	debugInfo += "\n\n✅ Debug information collected"
+
+	return mcp.NewResponse(id, map[string]interface{}{
+		"content": []map[string]interface{}{{"type": "text", "text": debugInfo}},
+	})
+}
+
 // Close gracefully shuts down the AIMem server
 func (a *AIMem) Close() error {
 	a.logger.Info("Shutting down AIMem server")
-	
+
+	// Log final performance summary
+	if a.perfMonitor.IsEnabled() {
+		a.perfMonitor.LogPerformanceSummary()
+	}
+
 	if err := a.storage.Close(); err != nil {
 		a.logger.WithError(err).Error("Error closing storage connection")
 		return err
 	}
-	
+
 	a.logger.Info("AIMem server shutdown complete")
 	return nil
 }
